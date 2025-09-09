@@ -1,59 +1,98 @@
-from fastapi import FastAPI
 import pennylane as qml
 from pennylane import qchem
 from pennylane import numpy as np
+import matplotlib.pyplot as plt
 
-app = FastAPI()
+# Constants
+ANGSTROM_TO_BOHR = 1.8897259886
 
-@app.get("/")
-def home():
-    return {"message": "LiH VQE API is running on Render!"}
+# Define LiH molecule symbols and coordinates (converted to Bohr units)
+symbols = ["Li", "H"]
+coordinates = np.array([
+    [0.0, 0.0, 0.0],
+    [0.0, 0.0, 1.6 * ANGSTROM_TO_BOHR],  # Li-H bond length in Bohr (~1.6 Å)
+])
 
-@app.get("/vqe")
-def run_vqe():
-    # Constants
-    ANGSTROM_TO_BOHR = 1.8897259886
-    symbols = ["Li", "H"]
-    coordinates = np.array([
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 1.6 * ANGSTROM_TO_BOHR],
-    ])
+# Create Molecule object with basis set
+molecule = qchem.Molecule(
+    symbols=symbols,
+    coordinates=coordinates,
+    charge=0,
+    mult=1,
+    basis_name="sto-3g"
+)
 
-    # Molecule
-    molecule = qchem.Molecule(symbols, coordinates, charge=0, mult=1, basis_name="sto-3g")
-    active_electrons, active_orbitals = 4, 4
-    hamiltonian, num_qubits = qchem.molecular_hamiltonian(
-        molecule, active_electrons=active_electrons, active_orbitals=active_orbitals
-    )
-    hf_state = qchem.hf_state(active_electrons, num_qubits)
-    singles, doubles = qchem.excitations(active_electrons, num_qubits)
-    s_wires, d_wires = qchem.excitations_to_wires(singles, doubles)
+# Active electrons and orbitals (reducing qubit count)
+# LiH has 4 electrons total. We'll consider 2 active electrons in 2 orbitals (minimal active space)
+active_electrons = 4
+active_orbitals = 4
 
-    dev = qml.device("default.qubit", wires=num_qubits)
-    from pennylane.templates.subroutines import UCCSD
+# Build Hamiltonian
+hamiltonian, num_qubits = qchem.molecular_hamiltonian(
+    molecule,
+    active_electrons=active_electrons,
+    active_orbitals=active_orbitals
+)
 
-    @qml.qnode(dev)
-    def circuit(params):
-        UCCSD(params, wires=range(num_qubits), s_wires=s_wires, d_wires=d_wires, init_state=hf_state)
-        return qml.expval(hamiltonian)
+print("Number of qubits:", num_qubits)
+print("Number of Hamiltonian terms:", len(hamiltonian))
 
-    # Optimization
-    params = np.zeros(len(s_wires) + len(d_wires), requires_grad=True)
-    optimizer = qml.AdamOptimizer(stepsize=0.1)
-    energy_progress = []
-    for n in range(50):  # fewer steps for speed
-        params, energy = optimizer.step_and_cost(circuit, params)
-        energy_progress.append(float(energy))
+# Prepare Hartree-Fock state
+hf_state = qchem.hf_state(active_electrons, num_qubits)
 
-    final_energy = float(energy)
+# Get single and double excitations
+singles, doubles = qchem.excitations(active_electrons, num_qubits)
 
-    # Exact diagonalization
-    Hmat = qml.utils.sparse_hamiltonian(hamiltonian).toarray()
-    eigvals, _ = np.linalg.eigh(Hmat)
-    exact_energy = float(np.min(eigvals))
+# Convert excitations to wire format
+s_wires, d_wires = qchem.excitations_to_wires(singles, doubles)
 
-    return {
-        "final_energy": final_energy,
-        "exact_energy": exact_energy,
-        "convergence": energy_progress
-    }
+# Define quantum device
+dev = qml.device("default.qubit", wires=num_qubits)
+
+from pennylane.templates import UCCSD
+
+# Define VQE circuit
+@qml.qnode(dev)
+def circuit(params):
+    UCCSD(params, wires=range(num_qubits), s_wires=s_wires, d_wires=d_wires, init_state=hf_state)
+    return qml.expval(hamiltonian)
+
+# Initialize parameters
+optimizer = qml.GradientDescentOptimizer(stepsize=0.1)
+params = np.zeros(len(s_wires) + len(d_wires), requires_grad=True)
+
+# Variables to track energy convergence
+previous_params = None
+energy_progress = []
+
+def store_intermediate_result(params, energy):
+    global previous_params
+    if previous_params is None or not np.allclose(previous_params, params):
+        energy_progress.append(energy)
+        previous_params = params.copy()
+        print(f"Tracked Energy: {energy:.6f}")
+
+# Optimization loop with tracking
+max_iters = 150
+for n in range(max_iters):
+    params, energy = optimizer.step_and_cost(circuit, params)
+    store_intermediate_result(params, energy)
+    if n % 10 == 0:
+        print(f"Step {n}, Params norm: {np.linalg.norm(params):.6f}")
+        print(f"Step {n}: Energy = {energy:.6f} Hartree")
+
+print("Final VQE energy (Hartree):", energy)
+
+# Exact diagonalization for comparison
+Hmat = qml.matrix(hamiltonian)
+eigvals, _ = np.linalg.eigh(Hmat)
+print("Exact ground state energy (Hartree):", np.min(eigvals))
+
+# Plot energy convergence
+plt.figure(figsize=(8, 5))
+plt.plot(range(len(energy_progress)), energy_progress, marker='o')
+plt.xlabel("Optimizer Call Count (Unique Parameter Updates)")
+plt.ylabel("Energy (Hartree)")
+plt.title("VQE Energy Convergence for LiH")
+plt.grid(True)
+plt.show()
